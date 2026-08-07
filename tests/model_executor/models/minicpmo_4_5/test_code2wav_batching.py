@@ -11,6 +11,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
 )
+from vllm_omni.utils.mm_outputs import OMIT_OMNI_OUTPUT_KEY, partition_payload_list
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -539,6 +540,83 @@ def test_prewarm_placeholder_step_emits_silence_without_touching_state(info):
     assert output.multimodal_outputs["model_outputs"][0].numel() == 0
     assert model._states == {}
     assert token2wav.hift.calls == []
+
+
+def test_setup_only_initializes_state_and_is_omitted_from_mixed_output() -> None:
+    model, token2wav = _model()
+    setup = _info("setup", 0, [])
+    setup["codes"]["audio"] = torch.tensor([0], dtype=torch.long)
+    setup["meta"].update({"setup_only": True, "code_flat_numel": 0})
+    real = _info("real", 0, [10, 11])
+
+    output = _forward(model, [setup, real], placeholder_counts=[1, 2])
+
+    assert model._states["setup"].chunk_seq == -1
+    assert model._states["real"].chunk_seq == 0
+    assert token2wav.flow.encoder.calls == [1, 1, 1]
+    assert token2wav.hift.calls == [1]
+    assert output.multimodal_outputs[OMIT_OMNI_OUTPUT_KEY][0].item() is True
+    assert output.multimodal_outputs[OMIT_OMNI_OUTPUT_KEY][1].item() is False
+
+    per_request = [
+        {key: values[index] for key, values in output.multimodal_outputs.items()}
+        for index in range(2)
+    ]
+    inter, client = partition_payload_list(per_request)
+    assert inter is not None
+    assert inter[0] is None
+    assert inter[1] is not None
+    assert client is not None
+    assert client[0] is None
+    assert client[1] is not None
+    assert client[1]["model_outputs"].numel() > 0
+
+
+def test_setup_only_retry_is_idempotent_before_first_codec_chunk() -> None:
+    model, token2wav = _model()
+    setup = _info("a", 0, [])
+    setup["codes"]["audio"] = torch.tensor([0], dtype=torch.long)
+    setup["meta"].update({"setup_only": True, "code_flat_numel": 0})
+
+    _forward(model, [setup])
+    _forward(model, [setup])
+
+    assert model._states["a"].chunk_seq == -1
+    assert token2wav.flow.encoder.calls == [1]
+    assert token2wav.hift.calls == []
+
+
+def test_setup_only_state_is_released_when_request_finishes() -> None:
+    model, _ = _model()
+    setup = _info("a", 0, [])
+    setup["codes"]["audio"] = torch.tensor([0], dtype=torch.long)
+    setup["meta"].update({"setup_only": True, "code_flat_numel": 0})
+
+    _forward(model, [setup])
+    model.on_requests_finished(["a"])
+
+    assert "a" not in model._states
+    assert "a" not in model._request_prompt_keys
+
+
+def test_setup_only_arriving_after_chunk_zero_is_rejected() -> None:
+    model, _ = _model()
+    _forward(model, [_info("a", 0, [10, 11])])
+    setup = _info("a", 0, [])
+    setup["codes"]["audio"] = torch.tensor([0], dtype=torch.long)
+    setup["meta"].update({"setup_only": True, "code_flat_numel": 0})
+
+    with pytest.raises(RuntimeError, match="late_setup_init"):
+        _forward(model, [setup])
+
+
+def test_setup_only_rejects_codec_frames() -> None:
+    model, _ = _model()
+    setup = _info("a", 0, [10])
+    setup["meta"].update({"setup_only": True, "code_flat_numel": 1})
+
+    with pytest.raises(RuntimeError, match="setup_contains_codec_frames"):
+        _forward(model, [setup])
 
 
 def test_metadata_only_payload_still_decodes_codec_from_prompt_tokens():

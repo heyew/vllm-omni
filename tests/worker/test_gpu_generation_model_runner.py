@@ -7,6 +7,7 @@ from vllm.config import CacheConfig
 from vllm.v1.worker.gpu_model_runner import EMPTY_MODEL_RUNNER_OUTPUT
 
 import vllm_omni.worker.gpu_generation_model_runner as gen_runner_module
+from vllm_omni.utils.mm_outputs import OMIT_OMNI_OUTPUT_KEY
 from vllm_omni.worker.gpu_generation_model_runner import (
     ExecuteModelState,
     GPUGenerationModelRunner,
@@ -16,14 +17,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyInputBatch:
-    def __init__(self):
-        self.req_ids = ["req-1"]
-        self.req_id_to_index = {"req-1": 0}
-        self.num_reqs = 1
+    def __init__(self, req_ids=None):
+        self.req_ids = req_ids or ["req-1"]
+        self.req_id_to_index = {req_id: index for index, req_id in enumerate(self.req_ids)}
+        self.num_reqs = len(self.req_ids)
         self.vocab_size = 10
 
 
-def _make_runner(multimodal_outputs):
+def _make_runner(multimodal_outputs, *, req_ids=None, async_chunk=False):
     runner = object.__new__(GPUGenerationModelRunner)
     runner.execute_model_state = ExecuteModelState(
         None,
@@ -40,13 +41,13 @@ def _make_runner(multimodal_outputs):
         None,
     )
     runner.kv_connector_output = None
-    runner.input_batch = _DummyInputBatch()
+    runner.input_batch = _DummyInputBatch(req_ids)
     runner.use_async_scheduling = False
     runner.device = torch.device("cpu")
     runner.supports_mm_inputs = False
     runner.speculative_config = None
     runner.routed_experts_initialized = False
-    runner._async_chunk = False
+    runner._async_chunk = async_chunk
     return runner
 
 
@@ -90,6 +91,27 @@ def test_sample_tokens_dict_output():
     assert "audio" in output.multimodal_outputs[0]
     assert "unused" not in output.multimodal_outputs[0]
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
+
+
+def test_sample_tokens_omits_setup_only_but_keeps_sibling_audio():
+    runner = _make_runner(
+        {
+            "model_outputs": [torch.empty(0), torch.ones(8)],
+            "sr": [torch.tensor(24000), torch.tensor(24000)],
+            OMIT_OMNI_OUTPUT_KEY: [torch.tensor(True), torch.tensor(False)],
+        },
+        req_ids=["setup", "audio"],
+        async_chunk=True,
+    )
+
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+
+    assert output.inter_stage_outputs is None
+    assert output.multimodal_outputs is not None
+    assert output.multimodal_outputs[0] is None
+    assert output.multimodal_outputs[1] is not None
+    assert output.multimodal_outputs[1]["model_outputs"].numel() == 8
+    assert OMIT_OMNI_OUTPUT_KEY not in output.multimodal_outputs[1]
 
 
 class _StubSchedulerOutput:

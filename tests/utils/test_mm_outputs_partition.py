@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from vllm_omni.utils.mm_outputs import partition_flat_payload, partition_payload_list
+from vllm_omni.utils.mm_outputs import (
+    OMIT_OMNI_OUTPUT_KEY,
+    partition_flat_payload,
+    partition_payload_list,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -45,6 +49,31 @@ def test_partition_payload_list_preserves_request_alignment():
     inter_list, client_list = partition_payload_list(payloads)
     assert inter_list == [payloads[0], None]
     assert client_list == [None, payloads[1]]
+
+
+def test_partition_omits_only_marked_request_from_mixed_batch():
+    setup_only = {
+        "model_outputs": torch.empty(0),
+        "sr": torch.tensor(24000),
+        "meta.tts_is_last_chunk": torch.tensor(False),
+        OMIT_OMNI_OUTPUT_KEY: torch.tensor(True),
+    }
+    real_audio = {
+        "model_outputs": torch.ones(2400),
+        "sr": torch.tensor(24000),
+        OMIT_OMNI_OUTPUT_KEY: torch.tensor(False),
+    }
+
+    inter_list, client_list = partition_payload_list([setup_only, real_audio])
+
+    assert inter_list is None
+    assert client_list == [
+        None,
+        {
+            "model_outputs": real_audio["model_outputs"],
+            "sr": real_audio["sr"],
+        },
+    ]
 
 
 def test_partition_duplex_audio_transcript_metadata_to_client_mm():

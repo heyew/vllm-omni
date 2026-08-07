@@ -8,6 +8,9 @@ import pytest
 import torch
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+    OmniChunkTransferAdapter,
+)
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     tts2code2wav_async_chunk,
     tts2code2wav_full_payload,
@@ -17,9 +20,12 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _manager():
+def _manager(*, setup_overlap: bool = False):
+    extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 3}
+    if setup_overlap:
+        extra["enable_code2wav_setup_overlap"] = True
     return SimpleNamespace(
-        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 25, "codec_left_context_frames": 3}}),
+        connector=SimpleNamespace(config={"extra": extra}),
         code_prompt_token_ids=defaultdict(list),
         request_payload={},
         put_req_chunk=defaultdict(int),
@@ -87,6 +93,79 @@ def test_first_chunk_threshold_is_25_generated_codes(count: int, emitted: bool) 
         assert _codes(payload) == [4218, 4218, 4218, *range(25)]
         assert payload.meta.chunk_seq == 0
         assert payload.meta.code_flat_numel == 28
+
+
+def test_setup_overlap_waits_for_codec_then_preserves_real_chunk_zero() -> None:
+    manager = _manager(setup_overlap=True)
+    request = _request("req")
+    request.additional_information = {
+        "codes": {"ref": torch.linspace(-0.1, 0.1, 16)},
+        "meta": {"ref_audio_sr": 16000},
+    }
+
+    assert tts2code2wav_async_chunk(manager, None, request, False) is None
+    setup = tts2code2wav_async_chunk(manager, _delta(10), request, False)
+
+    assert setup is not None
+    assert setup.meta.setup_only is True
+    assert setup.meta.chunk_seq == 0
+    assert setup.meta.code_flat_numel == 0
+    assert _codes(setup) == [0]
+    torch.testing.assert_close(setup.codes.ref, request.additional_information["codes"]["ref"])
+
+    first = tts2code2wav_async_chunk(manager, _delta(*range(11, 35)), request, False)
+    assert first is not None
+    assert first.meta.setup_only is False
+    assert first.meta.chunk_seq == 0
+    assert _codes(first) == [4218, 4218, 4218, 10, *range(11, 35)]
+
+
+def test_setup_then_real_chunk_clears_persistent_receiver_marker() -> None:
+    payloads = iter(
+        [
+            (
+                {
+                    "codes": {"audio": torch.tensor([0], dtype=torch.long)},
+                    "meta": {
+                        "setup_only": True,
+                        "code_flat_numel": 0,
+                        "finished": torch.tensor(False, dtype=torch.bool),
+                    },
+                },
+                1,
+            ),
+            (
+                {
+                    "codes": {"audio": torch.arange(28, dtype=torch.long)},
+                    "meta": {
+                        "setup_only": False,
+                        "code_flat_numel": 28,
+                        "finished": torch.tensor(False, dtype=torch.bool),
+                    },
+                },
+                28,
+            ),
+        ]
+    )
+    adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter.connector = SimpleNamespace(stage_id=2, get=lambda *_args, **_kwargs: next(payloads))
+    adapter.model_mode = "diffusion"
+    adapter.get_req_chunk = defaultdict(int)
+    adapter.request_ids_mapping = {}
+    adapter.finished_requests = set()
+    adapter.segment_finished_requests = set()
+    adapter._finished_load_reqs = set()
+
+    request = _request("req")
+    request.additional_information = None
+    request.prompt_token_ids = []
+    request.num_computed_tokens = 0
+
+    assert adapter._poll_single_request(request) is True
+    assert request.additional_information["meta"]["setup_only"] is True
+    assert adapter._poll_single_request(request) is True
+    assert request.additional_information["meta"]["setup_only"] is False
+    assert request.additional_information["meta"]["code_flat_numel"] == 28
 
 
 def test_steady_chunk_has_three_code_overlap_and_25_new_codes() -> None:
