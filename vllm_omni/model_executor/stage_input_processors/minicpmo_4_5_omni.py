@@ -35,6 +35,7 @@ class _MiniCPMO45MetaStruct(MetaStruct):
     segment_end: bool | None = None
     turn_end: bool | None = None
     tts_is_last_chunk: bool | None = None
+    setup_only: bool | None = None
 
 
 def _extract_first_audio_ref(multi_modal_data):
@@ -141,6 +142,13 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
     return chunk_frames, left_context_frames
 
 
+def _setup_overlap_enabled(transfer_manager: Any) -> bool:
+    connector = getattr(transfer_manager, "connector", None)
+    raw_config = getattr(connector, "config", {}) or {}
+    config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+    return bool(config.get("enable_code2wav_setup_overlap", False)) if isinstance(config, dict) else False
+
+
 def _codec_scalars(value: Any) -> list[int]:
     """Normalize one request-routed codec delta to CPU scalar token IDs."""
     if value is None:
@@ -201,6 +209,20 @@ def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
 def _is_aborted(request: Any) -> bool:
     status_name = getattr(getattr(request, "status", None), "name", "")
     return any(marker in status_name for marker in ("ABORT", "CANCEL", "IGNORED", "ERROR"))
+
+
+def _request_ref_audio(request: Any) -> tuple[torch.Tensor | None, int | None]:
+    request_info = getattr(request, "additional_information", None)
+    if not isinstance(request_info, Mapping):
+        return None, None
+    codes_info = request_info.get("codes")
+    meta_info = request_info.get("meta")
+    raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
+    raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
+    ref_audio_sr = _coerce_int(raw_ref_audio_sr)
+    if raw_ref_audio is None:
+        return None, ref_audio_sr
+    return torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu(), ref_audio_sr
 
 
 def tts2code2wav_async_chunk(
@@ -271,11 +293,13 @@ def tts2code2wav_async_chunk(
             "segment_text_recorded": False,
             "left_context": [],
             "codec_end": 0,
+            "setup_sent": False,
         }
         container[_MINICPMO45_ASYNC_STATE] = state
 
     pending = state["pending"]
-    pending.extend(_extract_codec_delta(multimodal_output, request_id))
+    codec_delta = _extract_codec_delta(multimodal_output, request_id)
+    pending.extend(codec_delta)
     pending_text_utf8 = state.setdefault("pending_text_utf8", [])
     current_text_utf8 = (
         segment_text_utf8.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
@@ -289,6 +313,42 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
+    if (
+        _setup_overlap_enabled(transfer_manager)
+        and not native_duplex
+        and not finished
+        and bool(codec_delta)
+        and not state.get("setup_sent", False)
+    ):
+        state["setup_sent"] = True
+        ref_audio, ref_audio_sr = _request_ref_audio(request)
+        return OmniPayloadStruct(
+            codes=CodesStruct(
+                # The generic generation connector needs one schedulable token;
+                # code_flat_numel=0 makes it a control placeholder, not codec.
+                audio=torch.tensor([0], dtype=torch.long),
+                ref=ref_audio,
+            ),
+            meta=_MiniCPMO45MetaStruct(
+                request_id=request_id,
+                # Keep transport positions non-negative. setup_only is the
+                # discriminator; Code2Wav maps this to internal state -1.
+                chunk_seq=0,
+                cache_epoch=int(record["cache_epoch"]),
+                code_flat_numel=0,
+                codec_chunk_frames=0,
+                codec_left_context_frames=0,
+                left_context_size=0,
+                last_chunk=False,
+                stream_finished=torch.tensor(False, dtype=torch.bool),
+                finished=torch.tensor(False, dtype=torch.bool),
+                is_segment_finished=torch.tensor(False, dtype=torch.bool),
+                req_id=[request_id],
+                setup_only=True,
+                ref_audio_sr=ref_audio_sr,
+            ),
+            request_id=request_id,
+        )
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
@@ -340,15 +400,7 @@ def tts2code2wav_async_chunk(
     ref_audio = None
     ref_audio_sr = None
     if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
-        request_info = getattr(request, "additional_information", None)
-        if isinstance(request_info, Mapping):
-            codes_info = request_info.get("codes")
-            meta_info = request_info.get("meta")
-            raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
-            raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
-            ref_audio_sr = _coerce_int(raw_ref_audio_sr)
-            if raw_ref_audio is not None:
-                ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
+        ref_audio, ref_audio_sr = _request_ref_audio(request)
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
     payload = OmniPayloadStruct(
         codes=CodesStruct(
@@ -374,6 +426,9 @@ def tts2code2wav_async_chunk(
             tts_is_last_chunk=flush_pending,
             turn_end=turn_end and last_chunk,
             ref_audio_sr=ref_audio_sr,
+            # Receiver metadata is persistent across chunks; omission would
+            # leave the earlier True marker attached to this real payload.
+            setup_only=False,
         ),
         request_id=request_id,
     )
@@ -439,6 +494,7 @@ def tts2code2wav_full_payload(
             ),
             duplex_turn_id=_coerce_int(duplex_info.get("model_turn_id", duplex_info.get("turn_id"))),
             duplex_epoch=_coerce_int(duplex_info.get("epoch")),
+            setup_only=False,
             segment_end=bool(meta_info.get("segment_end", False)),
             turn_end=bool(meta_info.get("turn_end", False)),
             tts_is_last_chunk=True,

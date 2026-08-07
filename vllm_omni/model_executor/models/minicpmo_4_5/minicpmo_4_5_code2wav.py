@@ -20,6 +20,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.mm_outputs import OMIT_OMNI_OUTPUT_KEY
 
 from .batched_token2wav import (
     BatchedToken2Wav,
@@ -104,6 +105,7 @@ class _WorkItem:
     segment_end: bool
     turn_end: bool
     has_payload: bool = True
+    setup_only: bool = False
 
 
 class MiniCPMO45Code2Wav(nn.Module):
@@ -356,61 +358,94 @@ class MiniCPMO45Code2Wav(nn.Module):
                 segment_end=False,
                 turn_end=False,
                 has_payload=False,
+                setup_only=False,
             )
         if not request_id:
             raise _batch_error("missing_request_id", output_index=index)
         cache_epoch = int(_scalar(meta.get("cache_epoch"), 0))
-        chunk_seq = int(_scalar(meta.get("chunk_seq"), 0))
-        if cache_epoch < 0 or chunk_seq < 0:
+        setup_only = bool(_scalar(meta.get("setup_only"), False))
+        transport_chunk_seq = int(_scalar(meta.get("chunk_seq"), 0))
+        if cache_epoch < 0 or (setup_only and transport_chunk_seq not in (-1, 0)) or (
+            not setup_only and transport_chunk_seq < 0
+        ):
             raise _batch_error(
                 "negative_stream_position",
                 request_id=request_id,
                 cache_epoch=cache_epoch,
-                chunk_seq=chunk_seq,
+                chunk_seq=transport_chunk_seq,
+                setup_only=setup_only,
             )
+        # The transport stays zero-based. Only the model's private state uses
+        # -1 to mean "setup completed, no codec chunk consumed yet".
+        chunk_seq = -1 if setup_only else transport_chunk_seq
         last_chunk = bool(_scalar(meta.get("last_chunk"), False))
         tts_is_last_chunk = bool(_scalar(meta.get("tts_is_last_chunk"), False))
         codes = info.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else None
         tokens = _codec_tensor(audio, segment)
-        if int(_scalar(meta.get("code_flat_numel"), tokens.numel())) == 0:
+        declared_code_numel = int(_scalar(meta.get("code_flat_numel"), tokens.numel()))
+        if setup_only and declared_code_numel != 0:
+            raise _batch_error(
+                "setup_contains_codec_frames",
+                request_id=request_id,
+                code_flat_numel=declared_code_numel,
+            )
+        if declared_code_numel == 0:
             # The generation scheduler reserves one placeholder token for an
             # empty terminal or segment-boundary chunk. The producer's
             # explicit length is the authority, so do not decode that
             # placeholder as codec data.
             tokens = segment.new_empty(0, dtype=torch.long)
         previous = self._states.get(state_id)
-        if previous is None:
-            if chunk_seq != 0:
+        if setup_only:
+            if previous is not None and cache_epoch < previous.cache_epoch:
                 raise _batch_error(
-                    "missing_state_for_chunk",
+                    "stale_cache_epoch",
+                    request_id=request_id,
+                    expected=previous.cache_epoch,
+                    actual=cache_epoch,
+                )
+            if previous is not None and cache_epoch > previous.cache_epoch:
+                previous = None
+            if previous is not None and previous.chunk_seq != -1:
+                raise _batch_error(
+                    "late_setup_init",
                     request_id=request_id,
                     cache_epoch=cache_epoch,
-                    chunk_seq=chunk_seq,
+                    last_consumed_chunk=previous.chunk_seq,
                 )
-        elif cache_epoch < previous.cache_epoch:
-            raise _batch_error(
-                "stale_cache_epoch",
-                request_id=request_id,
-                expected=previous.cache_epoch,
-                actual=cache_epoch,
-            )
-        elif cache_epoch > previous.cache_epoch:
-            if chunk_seq != 0:
+        else:
+            if previous is None:
+                if chunk_seq != 0:
+                    raise _batch_error(
+                        "missing_state_for_chunk",
+                        request_id=request_id,
+                        cache_epoch=cache_epoch,
+                        chunk_seq=chunk_seq,
+                    )
+            elif cache_epoch < previous.cache_epoch:
                 raise _batch_error(
-                    "new_epoch_requires_first_chunk",
+                    "stale_cache_epoch",
                     request_id=request_id,
-                    cache_epoch=cache_epoch,
-                    chunk_seq=chunk_seq,
+                    expected=previous.cache_epoch,
+                    actual=cache_epoch,
                 )
-            previous = None
-        elif chunk_seq != previous.chunk_seq + 1:
-            raise _batch_error(
-                "stale_or_reordered_chunk",
-                request_id=request_id,
-                expected=previous.chunk_seq + 1,
-                actual=chunk_seq,
-            )
+            elif cache_epoch > previous.cache_epoch:
+                if chunk_seq != 0:
+                    raise _batch_error(
+                        "new_epoch_requires_first_chunk",
+                        request_id=request_id,
+                        cache_epoch=cache_epoch,
+                        chunk_seq=chunk_seq,
+                    )
+                previous = None
+            elif chunk_seq != previous.chunk_seq + 1:
+                raise _batch_error(
+                    "stale_or_reordered_chunk",
+                    request_id=request_id,
+                    expected=previous.chunk_seq + 1,
+                    actual=chunk_seq,
+                )
         prompt_cache_id, prompt_wav, runtime_prompt_key = self._resolve_prompt(
             state_id,
             info,
@@ -452,6 +487,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
             turn_end=bool(_scalar(meta.get("turn_end"), False)),
+            setup_only=setup_only,
         )
 
     @staticmethod
@@ -551,15 +587,22 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._prune_unowned_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
-        sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
+        setup_items = [item for item in items if item.setup_only]
+        sentinels = [item for item in items if not item.setup_only and item.last_chunk and item.tokens.numel() == 0]
         segment_markers = [
-            item for item in items if not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
+            item
+            for item in items
+            if not item.setup_only and not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
         ]
-        compute_items = [item for item in items if item.tokens.numel() > 0]
+        compute_items = [item for item in items if not item.setup_only and item.tokens.numel() > 0]
         invalid_empty = [
             item.request_id
             for item in items
-            if item.has_payload and not item.last_chunk and not item.tts_is_last_chunk and item.tokens.numel() == 0
+            if item.has_payload
+            and not item.setup_only
+            and not item.last_chunk
+            and not item.tts_is_last_chunk
+            and item.tokens.numel() == 0
         ]
         if invalid_empty:
             self._prune_unowned_runtime_prompts()
@@ -586,6 +629,48 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
 
         pending: dict[str, _RequestState | None] = {item.state_id: None for item in sentinels}
+        setup_buckets: dict[tuple[str, str], list[_WorkItem]] = {}
+        for item in setup_items:
+            if item.previous is not None:
+                pending[item.state_id] = item.previous
+                continue
+            setup_buckets.setdefault(
+                (item.prompt_cache_id, item.prompt_wav),
+                [],
+            ).append(item)
+        for bucket in setup_buckets.values():
+            try:
+                features = self.backend.prepare_prompt(
+                    bucket[0].prompt_cache_id,
+                    bucket[0].prompt_wav,
+                )
+                states = self.backend.setup_batch(features, len(bucket))
+            except Exception as exc:
+                self._prune_unowned_runtime_prompts()
+                if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
+                    raise
+                raise _batch_error(
+                    "backend_unsupported_or_failed",
+                    request_ids=[item.request_id for item in bucket],
+                    phase="setup_only",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                ) from exc
+            if len(states) != len(bucket):
+                self._prune_unowned_runtime_prompts()
+                raise _batch_error(
+                    "backend_result_size_mismatch",
+                    expected=len(bucket),
+                    states=len(states),
+                )
+            for item, state in zip(bucket, states, strict=True):
+                pending[item.state_id] = _RequestState(
+                    cache_epoch=item.cache_epoch,
+                    chunk_seq=-1,
+                    prompt_cache_id=item.prompt_cache_id,
+                    prompt_wav=item.prompt_wav,
+                    token2wav=state,
+                )
         pending.update(
             {
                 item.state_id: _RequestState(
@@ -700,6 +785,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             multimodal_outputs={
                 "model_outputs": outputs,
                 "sr": [sample_rate_tensor.clone() for _ in outputs],
+                # setup_only performed useful private work but is not audio.
+                # The per-request marker is consumed before payload routing.
+                OMIT_OMNI_OUTPUT_KEY: [torch.tensor(item.setup_only, dtype=torch.bool) for item in items],
                 # Generation runner wire payloads are flat and tensor-only.
                 # Dotted metadata keys are unflattened again by the output
                 # processor before the full-duplex data plane consumes them.

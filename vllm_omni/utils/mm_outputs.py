@@ -9,6 +9,10 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Per-request model-output marker consumed locally by the generation runner.
+# It never enters either the inter-stage or client-facing payload channel.
+OMIT_OMNI_OUTPUT_KEY = "_omni.omit_output"
+
 # Flat payload keys partitioned at worker output into inter-stage connector
 # payloads vs client-facing multimodal outputs.  Only final output roots are
 # listed here; everything else remains available for stage-to-stage transport.
@@ -45,9 +49,16 @@ def partition_flat_payload(
     """Split a flattened per-request payload into inter-stage vs client mm dicts."""
     if not payload:
         return {}, {}
+    omit_output = payload.get(OMIT_OMNI_OUTPUT_KEY)
+    if isinstance(omit_output, torch.Tensor):
+        omit_output = bool(omit_output.reshape(-1)[0].item()) if omit_output.numel() else False
+    if bool(omit_output):
+        return {}, {}
     inter_stage: dict[str, object] = {}
     client_mm: dict[str, object] = {}
     for key, value in payload.items():
+        if key == OMIT_OMNI_OUTPUT_KEY:
+            continue
         root = key.split(".", 1)[0]
         if root in _CLIENT_MM_ROOT_KEYS:
             client_mm[key] = value

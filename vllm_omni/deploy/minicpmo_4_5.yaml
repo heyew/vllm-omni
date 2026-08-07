@@ -14,6 +14,9 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # Experimental and opt-in: prepare request-local Code2Wav state after
+      # the first Talker codec delta without changing the 25-frame chunk.
+      enable_code2wav_setup_overlap: true
 
 stages:
   - stage_id: 0

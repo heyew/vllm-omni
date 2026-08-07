@@ -67,6 +67,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     codec_chunk_frames: int
     codec_left_context_frames: int
     code_flat_numel: int
+    setup_only: bool
     last_chunk: bool
     req_id: list[str]
     left_context_size: int
@@ -188,6 +189,7 @@ class MetaStruct(_StructBase):
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
+    setup_only: bool | None = None
     omni_final_stage_id: int | None = None
 
 
