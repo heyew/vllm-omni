@@ -515,6 +515,22 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     mm_type = getattr(eco, "output_type", None) or default_mm_type
                     req_state.add_multimodal_tensor(mm_output, mm_type)
 
+            # A generation runner may intentionally suppress one row of a
+            # mixed batch (for example MiniCPM-o Code2Wav setup-only).  The
+            # scheduler still preserves request alignment with an EngineCore
+            # output whose multimodal payload is None.  Do not turn that
+            # nonterminal, tokenless placeholder into an empty client event.
+            # Terminal rows are deliberately retained so request cleanup is
+            # never skipped.
+            if (
+                req_state.detokenizer is None
+                and eco.pooling_output is None
+                and getattr(eco, "multimodal_output", None) is None
+                and not eco.new_token_ids
+                and eco.finish_reason is None
+            ):
+                continue
+
             # Route: if no detokenizer and no pooling output, handle locally
             # to avoid upstream's assert on detokenizer.
             if req_state.detokenizer is None and eco.pooling_output is None:

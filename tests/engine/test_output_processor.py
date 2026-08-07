@@ -492,6 +492,64 @@ def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypa
     assert AUDIO in result.request_outputs[0].outputs[0].multimodal_output
 
 
+def test_no_detokenizer_none_multimodal_output_emits_no_audio_completion(monkeypatch):
+    """A runner-suppressed setup row must not become an empty audio event."""
+    state = _make_no_detok_state(RequestOutputKind.DELTA)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.output_modality = OutputModality.AUDIO
+    processor.request_states = {"r": state}
+    monkeypatch.setattr(
+        VLLMOutputProcessor,
+        "process_outputs",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            request_outputs=[],
+            reqs_to_abort=[],
+        ),
+    )
+    engine_output = SimpleNamespace(
+        request_id="r",
+        multimodal_output=None,
+        output_type="audio",
+        pooling_output=None,
+        new_token_ids=[],
+        finish_reason=None,
+        stop_reason=None,
+        kv_transfer_params=None,
+        routed_experts=None,
+        num_cached_tokens=0,
+    )
+
+    result = processor.process_outputs([engine_output])
+
+    assert result.request_outputs == []
+    assert state.mm_accumulated == {}
+    assert "r" in processor.request_states
+
+
+def test_no_detokenizer_none_multimodal_terminal_output_still_finishes(monkeypatch):
+    """Suppressing placeholders must not suppress a real terminal event."""
+    processor = _make_mm_only_output_processor(monkeypatch)
+    engine_output = SimpleNamespace(
+        request_id="r",
+        multimodal_output=None,
+        output_type="audio",
+        pooling_output=None,
+        new_token_ids=[],
+        finish_reason=FinishReason.STOP,
+        stop_reason=None,
+        kv_transfer_params=None,
+        routed_experts=None,
+        num_cached_tokens=0,
+        is_segment_finished=False,
+    )
+
+    result = processor.process_outputs([engine_output])
+
+    assert len(result.request_outputs) == 1
+    assert result.request_outputs[0].finished is True
+    assert "r" not in processor.request_states
+
+
 def _make_mm_only_output_processor(monkeypatch):
     processor = object.__new__(MultimodalOutputProcessor)
     processor.output_modality = OutputModality.AUDIO
