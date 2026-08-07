@@ -1059,33 +1059,42 @@ async def async_request_openai_chat_omni_completions(
                                         if has_text_content:
                                             generated_text += content
                                     elif modality == "audio":
-                                        if output.audio_ttfp == 0.0:
-                                            output.audio_ttfp = timestamp - st
-                                        audio_generate_time = timestamp - st
+                                        has_audio_frames = False
                                         if content:
                                             audio_bytes = base64.b64decode(content)
                                             if response_format == "wav":
                                                 try:
                                                     with wave.open(io.BytesIO(audio_bytes), "rb") as wav_reader:
+                                                        frame_count = wav_reader.getnframes()
+                                                        pcm_bytes = wav_reader.readframes(frame_count)
                                                         params = (
                                                             wav_reader.getnchannels(),
                                                             wav_reader.getsampwidth(),
                                                             wav_reader.getframerate(),
                                                         )
-                                                        if wav_audio_params is None:
-                                                            wav_audio_params = params
-                                                        elif wav_audio_params != params:
-                                                            wav_inconsistent_chunk_count += 1
-                                                            if first_inconsistent_wav_params is None:
-                                                                first_inconsistent_wav_params = params
-                                                            continue
-                                                        wav_pcm_buffer.extend(
-                                                            wav_reader.readframes(wav_reader.getnframes())
-                                                        )
+                                                        # A valid WAV container may contain only its
+                                                        # 44-byte header.  Such a control/metadata
+                                                        # event is not an audio packet and must not
+                                                        # end TTFP or extend audio generation time.
+                                                        if frame_count > 0 and pcm_bytes:
+                                                            if wav_audio_params is None:
+                                                                wav_audio_params = params
+                                                            elif wav_audio_params != params:
+                                                                wav_inconsistent_chunk_count += 1
+                                                                if first_inconsistent_wav_params is None:
+                                                                    first_inconsistent_wav_params = params
+                                                                continue
+                                                            wav_pcm_buffer.extend(pcm_bytes)
+                                                            has_audio_frames = True
                                                 except Exception as ex:
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
-                                            else:
+                                            elif audio_bytes:
                                                 audio_bytes_buffer.extend(audio_bytes)
+                                                has_audio_frames = True
+                                        if has_audio_frames:
+                                            if output.audio_ttfp == 0.0:
+                                                output.audio_ttfp = timestamp - st
+                                            audio_generate_time = timestamp - st
                                     elif modality == "image":
                                         output.image_count += 1
                                         content_image_ms = _image_generation_ms_from_content(content)
