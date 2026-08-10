@@ -208,17 +208,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         sampling_params_list: list[Any],
         output_modalities: list[str] | tuple[str, ...] | None,
     ) -> list[Any]:
-        """Keep MiniCPM-o 4.5's thinker final-only during audio streaming.
+        """Enable MiniCPM-o 4.5 text and audio streaming independently.
 
         Chat ``stream=true`` normally coerces every AR stage to DELTA output.
-        That is correct for token-level text streaming, but MiniCPM-o 4.5's
-        Talker consumes the completed TTS span plus aligned thinker hidden
-        states. If Stage0 is DELTA, llm2tts receives one generated token at a
-        time and repeatedly starts tiny, independent TTS streams. The API then
-        never represents one coherent audio response.
-
-        For this model, stream the audio stage, not the thinker-to-talker
-        boundary.
+        Keep that behavior for both the Thinker and Talker. The orchestrator
+        emits every Thinker DELTA to the client because Stage 0 is a final text
+        output, but only forwards an ordinary (non-resumable) request to the
+        Talker after the Thinker finishes. The terminal DELTA carries cumulative
+        token ids and the complete aligned hidden-state snapshot required by
+        ``llm2tts``. This gives the frontend early text without starting
+        multiple independent TTS streams.
         """
         if not output_modalities or "audio" not in output_modalities:
             return sampling_params_list
@@ -238,11 +237,41 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 continue
 
             model_stage = self._stage_get(engine_args, "model_stage")
-            if model_stage == "llm":
-                sp.output_kind = RequestOutputKind.FINAL_ONLY
-            elif model_stage == "tts":
+            if model_stage in {"llm", "tts"}:
                 sp.output_kind = RequestOutputKind.DELTA
         return sampling_params_list
+
+    def _should_coalesce_minicpmo45_text_deltas(
+        self,
+        request: ChatCompletionRequest,
+        reasoning_parser: ReasoningParser | None,
+    ) -> bool:
+        """Use a first-plus-final text stream for simple MiniCPM-o audio chat."""
+        return bool(
+            "audio" in (request.modalities or [])
+            and self._has_minicpmo45_stage()
+            and not self.use_harmony
+            and reasoning_parser is None
+            and not request.tools
+            and not request.echo
+            and not request.logprobs
+            and not request.return_token_ids
+        )
+
+    @staticmethod
+    def _coalesce_first_and_final_text_delta(
+        delta_text: str,
+        *,
+        finished: bool,
+        first_emitted: bool,
+        pending_text: str,
+    ) -> tuple[str | None, bool, str]:
+        """Return text to emit now, updated first-token state, and buffer."""
+        if not first_emitted and delta_text:
+            return delta_text, True, pending_text
+        if not finished:
+            return None, first_emitted, pending_text + delta_text
+        return pending_text + delta_text, first_emitted, ""
 
     @classmethod
     def for_diffusion(
@@ -1313,6 +1342,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
         previous_num_tokens = [0] * num_choices
+        coalesce_minicpmo45_text_deltas = self._should_coalesce_minicpmo45_text_deltas(
+            request,
+            reasoning_parser,
+        )
+        first_text_delta_emitted = [False] * num_choices
+        pending_text_deltas = [""] * num_choices
         finish_reason_sent = [False] * num_choices
         modality_finished: list[set[str]] = [set() for _ in range(num_choices)]
         modality_seen: list[set[str]] = [set() for _ in range(num_choices)]
@@ -1516,6 +1551,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             cur_recipient = harmony_parser.current_recipient
                         else:
                             delta_text = output.text or ""
+
+                        if coalesce_minicpmo45_text_deltas:
+                            delta_text, first_text_delta_emitted[i], pending_text_deltas[i] = (
+                                self._coalesce_first_and_final_text_delta(
+                                    delta_text,
+                                    finished=output.finish_reason is not None,
+                                    first_emitted=first_text_delta_emitted[i],
+                                    pending_text=pending_text_deltas[i],
+                                )
+                            )
+                            if delta_text is None:
+                                previous_num_tokens[i] += len(output.token_ids)
+                                continue
 
                         if not delta_text and not output.token_ids and not previous_num_tokens[i]:
                             # Chunked prefill case, don't return empty chunks
