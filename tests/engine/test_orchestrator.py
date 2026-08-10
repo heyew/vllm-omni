@@ -13,7 +13,7 @@ from typing import Any
 import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.messages import (
@@ -540,6 +540,79 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         assert output_msg.finished is True
         assert output_msg.engine_outputs.request_id == "req-llm"
         assert "req-llm" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_delta_thinker_streams_text_but_submits_talker_once(
+    orchestrator_factory,
+) -> None:
+    """A non-resumable DELTA stage is visible early but forwards only at finish."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="text")
+    stage1 = FakeStageClient(
+        stage_type="llm",
+        final_output=True,
+        final_output_type="audio",
+        next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+    )
+    stage0_processor = FakeOutputProcessor(
+        request_outputs=[
+            _build_request_output(
+                "req-delta-thinker",
+                token_ids=[3],
+                finished=False,
+                text="first",
+            )
+        ]
+    )
+    stage1_processor = FakeOutputProcessor(
+        request_outputs=[
+            _build_request_output("req-delta-thinker", token_ids=[10], finished=True)
+        ]
+    )
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[stage0_processor, stage1_processor],
+    )
+    stage0_params = _sampling_params()
+    stage0_params.output_kind = RequestOutputKind.DELTA
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-delta-thinker",
+            prompt=SimpleNamespace(
+                request_id="req-delta-thinker",
+                prompt_token_ids=[1, 2],
+            ),
+            original_prompt={"prompt": "hello"},
+            sampling_params_list=[stage0_params, _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-delta", 1.0))
+        first_output = await _get_output_message(orchestrator_fixture)
+
+        assert first_output.stage_id == 0
+        assert first_output.finished is False
+        assert len(stage1.add_request_calls) == 0
+
+        stage0_processor.request_outputs = [
+            _build_request_output(
+                "req-delta-thinker",
+                token_ids=[3, 4],
+                finished=True,
+                text="first final",
+            )
+        ]
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-final", 2.0))
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+
+        assert len(stage1.add_request_calls) == 1
+        talker_request = stage1.add_request_calls[0][0]
+        assert talker_request.prompt_token_ids == [7, 8, 9]
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
